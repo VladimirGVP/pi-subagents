@@ -2,6 +2,56 @@
 
 Public seams for other Pi extensions and host integrations: the in-process RPC, the structured delegation API, launch preflight, capability ceilings, the background-work provider contract, and the Herdr integration.
 
+## Read-only resource inspection
+
+`pi-subagents-inspect-resources` is the package-owned inspection executable (Node 24+). **`pi-subagents` remains the installer**, unchanged. From a source checkout the equivalent invocation is `node ./resource-inspector.mjs`.
+
+```sh
+HOME=/absolute/isolated-home \
+PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT=/absolute/trusted/pi-coding-agent-installation \
+pi-subagents-inspect-resources \
+  --cwd /absolute/project \
+  --agent-dir /absolute/isolated-agent-config \
+  --project-trust trusted
+```
+
+The three flags are required exactly once, with separate, nonempty values. Unknown flags (including `--help`), duplicates, invalid trust values and missing arguments exit **2**, with a bounded `{"error":"code"}` on stderr and **no partial stdout**. Success emits one JSON object and exits 0. Directories must already exist; the inspector does not create fixtures or copy live settings. Both the global `agentDir/settings.json` and cwd-local `.pi/settings.json` must exist. The supplied HOME must be isolated from the OS account's canonical home. Canonical live `~/.pi/agent` and recognized credential paths are forbidden, including through symlinks.
+
+The SDK root override selects an existing **trusted Pi installation**, not an extension or resource package. Without it the normal `@earendil-works/pi-coding-agent` dependency is used. Tested against Pi SDK **0.85.1**; the repository's test shim deliberately cannot provide inspection. No SDK, extension or model installation is performed.
+
+The public `pi-subagents/resource-inspection` subpath exports `inspectResources`, `parseResourceInspectionArgs`, `ResourceInspectionOptions` and `ResourceInspectionError`:
+
+```typescript
+import { inspectResources } from "pi-subagents/resource-inspection";
+const report = await inspectResources({
+  cwd: "/absolute/project",
+  agentDir: "/absolute/isolated-agent-config",
+  projectTrust: "trusted",
+});
+```
+
+The API requires the caller to have **already** provided isolated HOME, matching `PI_CODING_AGENT_DIR`, and `PI_OFFLINE=1`. It does not modify ambient environment variables and is not a live-host inspection endpoint. The dedicated CLI sets only its own offline/agent-dir variables. `PI_SUBAGENT_EXTRA_AGENT_DIRS` must be unset/empty. The API throws a sanitized `ResourceInspectionError` on rejection.
+
+### Meaning and supported boundary
+
+- `mode: "config_effective"` is not a live-session roster. The official `DefaultPackageManager.resolve(async () => "error")`, `loadSkills({includeDefaults:false,...})`, and `loadProjectContextFiles()` compose with the package's actual `discoverAgentSnapshot()` policy. No agent tool, session, provider/model registry, prompt dispatch, child process, extension code, network operation or authentication is invoked.
+- JSON contains canonical cwd, agentDir, actual Pi settings paths and separate agent-snapshot settings paths (which can refer to a configured ancestor project). Trust is an **explicit, nonpersisted override**, not a claim that a live session trusts the project. `untrusted` is recognized but fails with `untrusted_snapshot_requires_host`: the package snapshot cannot independently implement Pi host trust policy.
+- Agent `effective` entries retain existing defaults/override/precedence selection. Metadata-only `candidates` retain parsed definitions **before same-source deduplication**, including losing project and package definitions. `winnerPath` links candidates to the actual effective result; null means no effective name. Directory states retain discovery provenance. Prompts and descriptions are excluded.
+- `runtimeRegistry` and `sessionCapabilityCeiling` are **`host_required`**, never falsely absent. No runtime registration is inferred or activated.
+- Skills expose effective name/path pairs, enabled/disabled resolved resource paths, and collision diagnostics with winner/loser paths. Other skill diagnostics reject the inspection rather than silently producing an incomplete roster. Project/global context is **paths only**, never contents.
+
+This first boundary supports `.pi` config, literal resource paths, local directory packages with valid manifests, **already-managed npm packages** with an unversioned source or exact `x.y.z` version, and **already-installed SDK-managed Git packages** using a supported `git:` source pinned with a full 40-hex commit ID. Git inspection calls the public `DefaultPackageManager.getInstalledPath(source, scope)` before `resolve()`, then admits only the matching nonsymlink SDK Git root for that settings scope. A configured Git commit is configuration provenance only: this inspector does not run Git or claim the installed checkout was verified at that revision. Manifest-less Git packages use Pi's default resource directories; a present malformed manifest or an explicit missing resource path still fails closed. Package resource filters remain handled by Pi. Git branches/tags/short or missing refs, unsupported Git spellings, npm ranges/tags, legacy global npm fallback, resource/manifest/agentScanDirs globs or negations, paths with any symlinked ancestor or resource entry, and linked-worktree context are explicitly rejected; none are silently omitted. The project must be a normal directory/git checkout rather than a linked worktree. Absent implicit resource directories and an absent unused trust store are normal; malformed existing config/trust and missing explicitly configured resources fail closed.
+
+The symlink restriction covers every examined path component up to the filesystem root, not only resource entries. OS aliases such as macOS `/tmp` are therefore rejected; supply paths without symlinked components (for example `/private/tmp`) instead.
+
+`subagents.agentScanDirs` follows the existing agent resolver: relative entries resolve against the inspector process's working directory, not the `--cwd` value. Run the command from the intended project directory when using relative scan entries; `--cwd` alone does not retarget them.
+
+Admission prevalidates global, ancestor and package resource surfaces before discovery (including sources later shadowed/disabled). Bounds: 64 cwd ancestors; recursive depth 12; 1024 entries per resource directory; 4096 visited resource files/directories; 2 MiB per file, 16 MiB total file sizes; 256 configured entries per array; 1 MiB JSON output. Broad roots such as HOME or `/` are rejected. These are conservative admission limits, not a replacement discovery/precedence algorithm. Freeze/isolate input trees while inspecting: prevalidation is **not a race-proof sandbox**, filesystem snapshot, or defense against malicious SDK code.
+
+Pi's offline mode alone is insufficient: it can silently skip missing npm/git packages, and a missing user npm package can execute `npm root -g` before the missing-source callback. The inspector admits supported Git sources through `getInstalledPath()` and rejects missing, scope-mismatched, unmanaged or symlinked Git roots **before** Pi is called, so no Git resolver, fetch, clone, update or fallback is available to inspection.
+
+Permanent synthetic integration tests exercise the CLI with an installed real SDK, pinned managed Git packages (including manifest-less `skills/brainstorming`), local packages and Phase-A-style dogfood/codex-image/techlead collisions; they freeze fixture files, compare metadata/content hashes, and trap mutation, auth reads, network and subprocess attempts. The negative matrix covers missing/scope-mismatched/unmanaged/symlinked Git roots and floating Git refs. On development hosts without a real SDK, those real-SDK cases explicitly skip (set the SDK root override to enable them). Synthetic success does not authorize consumer changes, publication, installation or live activation; independent real-consumer canaries remain a separate gate.
+
 ## Trusted workflow resources
 
 Loaded trusted TypeScript extensions can import `registerWorkflowResource` from `pi-subagents/workflow-resources`. This subpath does not load the main extension and exposes no resolver or permit constructor. Its exported types are `RegisterWorkflowResourceInput`, `WorkflowResourceDefinition`, and `WorkflowResourceRegistration`:
