@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import { splitKnownThinkingSuffix } from "../../shared/model-info.ts";
 import { TEMP_ROOT_DIR } from "../../shared/types.ts";
 import { getAgentDir } from "../../shared/utils.ts";
@@ -13,6 +14,20 @@ export type ModelExclusion = ModelExclusionTarget & {
 	recordedAt: number;
 	expiresAt: number;
 };
+
+export interface ModelRecoveryProbe {
+	candidate: string;
+	exclusion: Readonly<ModelExclusion>;
+}
+
+export interface ClaimedModelRecoveryProbe extends ModelRecoveryProbe {
+	owner: string;
+}
+
+export type ModelRecoveryProbeClaim =
+	| { status: "claimed"; probe: ClaimedModelRecoveryProbe }
+	| { status: "in-flight" }
+	| { status: "not-eligible" };
 
 type RecordModelFailureOptions = ModelExclusionTarget & {
 	reason?: string;
@@ -64,8 +79,7 @@ function invalidateAuthExclusions(): void {
 	if (authStoreMtimeMs === undefined) return;
 	const retained = exclusions.filter((entry) => !isAuthModelExclusion(entry) || authStoreMtimeMs <= entry.recordedAt);
 	if (retained.length === exclusions.length) return;
-	exclusions = retained;
-	schedulePersist();
+	exclusions = withExclusionStoreMutation((current) => current.filter((entry) => !isAuthModelExclusion(entry) || authStoreMtimeMs <= entry.recordedAt));
 }
 
 /**
@@ -101,18 +115,12 @@ export function getExclusionsFilePath(): string {
  * (and in tests).
  */
 export function flushPersist(): void {
-	const file = getExclusionsFilePath();
-	try {
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const tmpPath = `${file}.${process.pid}.${persistSeq++}.tmp`;
-		fs.writeFileSync(tmpPath, JSON.stringify({
-			version: 1,
-			exclusions: deduplicate(exclusions),
-		}, null, 2), "utf-8");
-		fs.renameSync(tmpPath, file);
-	} catch (error) {
-		console.error(`[model-exclusions] Failed to persist exclusions to ${file}:`, error);
-	}
+	// All public mutations persist immediately. This remains for callers that
+	// need a barrier and applies only the durable TTL policy to current disk.
+	withExclusionStoreMutation((current) => {
+		if (loadedTTLCeilingMs !== undefined) shortenExclusionsToTTL(current, loadedTTLCeilingMs, Date.now());
+		return current;
+	});
 }
 
 function schedulePersist(): void {
@@ -123,6 +131,166 @@ function schedulePersist(): void {
 	}, 5000);
 	// Never hold the process open just to flush exclusions.
 	persistTimer.unref?.();
+}
+
+function readPersistedExclusionsForMutation(): ModelExclusion[] {
+	try {
+		const data = JSON.parse(fs.readFileSync(getExclusionsFilePath(), "utf-8")) as { version?: unknown; exclusions?: unknown };
+		if (data.version !== 1 || !Array.isArray(data.exclusions)) return [];
+		const now = Date.now();
+		return deduplicate(data.exclusions.flatMap((entry, index) => {
+			const parsed = readPersistedExclusion(entry, index);
+			return parsed.ok && parsed.exclusion.expiresAt > now ? [parsed.exclusion] : [];
+		}));
+	} catch {
+		// A mutation is also the recovery path for a corrupt/missing store.
+		return [];
+	}
+}
+
+function writePersistedExclusions(next: ModelExclusion[]): void {
+	const file = getExclusionsFilePath();
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const tmpPath = `${file}.${process.pid}.${persistSeq++}.tmp`;
+	fs.writeFileSync(tmpPath, JSON.stringify({ version: 1, exclusions: deduplicate(next) }, null, 2), "utf-8");
+	fs.renameSync(tmpPath, file);
+}
+
+const MUTATION_LOCK_WAIT_MS = 5_000;
+
+/** Linux's start-time tick is immutable for a process lifetime and detects PID reuse. */
+function processStartIdentity(pid: number): string | undefined {
+	try {
+		const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+		const closeParen = stat.lastIndexOf(")");
+		const fields = closeParen === -1 ? [] : stat.slice(closeParen + 2).trim().split(/\s+/);
+		return fields[19] || undefined; // field 22; fields begin at field 3 after comm/state.
+	} catch {
+		return undefined;
+	}
+}
+
+function sleepForClaim(): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+}
+
+function claimIsLive(claim: StoredClaim | undefined): boolean {
+	if (!claim || !isLiveProcess(claim.pid)) return false;
+	if (!claim.processStart) return true; // Legacy/unverifiable identity: conservatively never steal a live PID.
+	const currentStart = processStartIdentity(claim.pid);
+	return currentStart === undefined || currentStart === claim.processStart;
+}
+
+const MAX_CLAIM_SUCCESSOR_DEPTH = 16;
+
+type ClaimNode =
+	| { status: "missing" }
+	| { status: "present"; raw: string; claim: StoredClaim | undefined }
+	| { status: "unreadable" };
+
+/** Read a node once so a successor is tied to the exact immutable predecessor bytes. */
+function readClaimNode(claimPath: string): ClaimNode {
+	let raw: string;
+	try {
+		raw = fs.readFileSync(claimPath, "utf-8");
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT" ? { status: "missing" } : { status: "unreadable" };
+	}
+	try {
+		const value = JSON.parse(raw) as Partial<StoredClaim>;
+		const legacyPid = typeof value.owner === "string" ? Number(/^([1-9]\d*)-/.exec(value.owner)?.[1]) : NaN;
+		const pid = typeof value.pid === "number" ? value.pid : legacyPid;
+		const claim = typeof value.owner === "string" && Number.isSafeInteger(pid) && pid > 0
+			&& typeof value.expiresAt === "number" && Number.isFinite(value.expiresAt)
+			&& (value.processStart === undefined || typeof value.processStart === "string")
+			? { owner: value.owner, pid, expiresAt: value.expiresAt, ...(typeof value.processStart === "string" ? { processStart: value.processStart } : {}) }
+			: undefined;
+		return { status: "present", raw, claim };
+	} catch {
+		// A partial or malformed file is an immutable dead generation, not a path
+		// that a contender may remove.
+		return { status: "present", raw, claim: undefined };
+	}
+}
+
+/**
+ * A successor is named from both its predecessor pathname and exact bytes. All
+ * contenders that observe one stale node therefore link the same absent name;
+ * no recovery path ever renames or unlinks a stale node.
+ */
+function successorClaimPath(predecessorPath: string, predecessorContents: string): string {
+	const identity = createHash("sha256").update(predecessorPath).update("\0").update(predecessorContents).digest("hex");
+	return path.join(path.dirname(predecessorPath), `${path.basename(predecessorPath)}.successor-${identity}`);
+}
+
+/**
+ * Acquire an append-only claim chain. A live owner blocks even after TTL expiry.
+ * A dead, reused-PID, or malformed predecessor stays immutable and selects one
+ * deterministic successor through link(O_EXCL). Normal release unlinks only the
+ * owner's current node, allowing the same successor of a stale predecessor to be
+ * recreated without ever changing that predecessor.
+ */
+function acquireCanonicalClaim(genesisPath: string, owner: string, waitMs = MUTATION_LOCK_WAIT_MS): { owner: string; claimPath: string } | undefined {
+	const deadline = Date.now() + waitMs;
+	for (;;) {
+		try { fs.mkdirSync(path.dirname(genesisPath), { recursive: true, mode: 0o700 }); } catch { return undefined; }
+		let claimPath = genesisPath;
+		let restart = false;
+		for (let depth = 0; depth <= MAX_CLAIM_SUCCESSOR_DEPTH; depth++) {
+			const node = readClaimNode(claimPath);
+			if (node.status === "unreadable") return undefined; // Fail closed on filesystem corruption/errors.
+			if (node.status === "missing") {
+				if (writeImmutableClaim(path.dirname(claimPath), owner, path.basename(claimPath))) return { owner, claimPath };
+				restart = true; // A concurrent link won; inspect its complete node.
+				break;
+			}
+			if (node.claim && claimIsLive(node.claim)) {
+				restart = true;
+				break;
+			}
+			claimPath = successorClaimPath(claimPath, node.raw);
+		}
+		if (!restart) return undefined; // The immutable chain is excessive.
+		if (Date.now() >= deadline) return undefined;
+		sleepForClaim();
+	}
+}
+
+function releaseCanonicalClaim(claimPath: string, owner: string): void {
+	// O_EXCL publication means no protocol participant can replace this pathname
+	// while it exists. Check the exact token, then unlink only this owner's node.
+	if (readClaim(claimPath)?.owner !== owner) return;
+	try { fs.unlinkSync(claimPath); } catch { /* a filesystem error leaves this immutable node recoverable */ }
+}
+
+/** Locate an owner's current successor without ever changing its predecessors. */
+function findClaimPathForOwner(genesisPath: string, owner: string): string | undefined {
+	let claimPath = genesisPath;
+	for (let depth = 0; depth <= MAX_CLAIM_SUCCESSOR_DEPTH; depth++) {
+		const node = readClaimNode(claimPath);
+		if (node.status !== "present") return undefined;
+		if (node.claim?.owner === owner) return claimPath;
+		claimPath = successorClaimPath(claimPath, node.raw);
+	}
+	return undefined;
+}
+
+function acquireImmutableMutationClaim(): { owner: string; claimPath: string } | undefined {
+	const owner = `${process.pid}-${randomUUID()}`;
+	return acquireCanonicalClaim(`${getExclusionsFilePath()}.mutation-claim.json`, owner);
+}
+
+function withExclusionStoreMutation(mutator: (current: ModelExclusion[]) => ModelExclusion[]): ModelExclusion[] {
+	const claim = acquireImmutableMutationClaim();
+	if (!claim) throw new Error(`Unable to acquire exclusion persistence mutation claim within ${MUTATION_LOCK_WAIT_MS}ms.`);
+	try {
+		const next = deduplicate(mutator(readPersistedExclusionsForMutation()));
+		writePersistedExclusions(next);
+		exclusions = next;
+		return next;
+	} finally {
+		releaseCanonicalClaim(claim.claimPath, claim.owner);
+	}
 }
 
 function ensureLoaded(): void {
@@ -218,10 +386,12 @@ export function recordModelFailure(options: RecordModelFailureOptions): void {
 		recordedAt: now,
 		expiresAt: now + ttl,
 	};
-	exclusions.unshift(exclusion);
-	exclusions = deduplicate(exclusions);
-	if (exclusions.length > 200) exclusions.length = 200;
-	flushPersist();
+	exclusions = withExclusionStoreMutation((current) => {
+		if (loadedTTLCeilingMs !== undefined) shortenExclusionsToTTL(current, loadedTTLCeilingMs, now);
+		const next = deduplicate([exclusion, ...current]);
+		if (next.length > 200) next.length = 200;
+		return next;
+	});
 }
 
 /**
@@ -230,8 +400,10 @@ export function recordModelFailure(options: RecordModelFailureOptions): void {
 export function clearExpiredExclusions(): void {
 	ensureLoaded();
 	invalidateAuthExclusions();
-	prune(exclusions, Date.now());
-	schedulePersist();
+	const now = Date.now();
+	if (exclusions.some((entry) => entry.expiresAt <= now)) {
+		exclusions = withExclusionStoreMutation((current) => current.filter((entry) => entry.expiresAt > now));
+	}
 }
 
 /**
@@ -239,8 +411,7 @@ export function clearExpiredExclusions(): void {
  */
 export function clearExclusions(): void {
 	ensureLoaded();
-	exclusions.length = 0;
-	schedulePersist();
+	exclusions = withExclusionStoreMutation(() => []);
 }
 
 /**
@@ -282,6 +453,138 @@ export function findModelExclusion(fullId: string, now = Date.now()): Readonly<M
 	invalidateAuthExclusions();
 	const { provider, modelId } = parseModelKey(fullId);
 	return exclusions.find((entry) => entryMatches(entry, modelId, provider, now));
+}
+
+// Keep recovery probes strictly narrower than ordinary fallback failures: credential,
+// quota, model-registry, and request-shape failures must stay fail-closed for 24h.
+const NON_RECOVERABLE_PROBE_REASON_PATTERNS = [
+	/auth(?:entication)?/i, /unauthori[sz]ed/i, /forbidden/i, /api key/i, /token expired/i, /invalid key/i,
+	/\b(?:401|402|403|429)\b/, /rate\s*limit/i, /request[_\s-]*limit/i, /quota/i, /billing/i, /credit/i,
+	/model.*not found/i, /unknown model/i, /model.*disabled/i,
+	/\b(?:bad[ _]request|invalid[ _]argument|invalid_request_error|invalid request|request validation|malformed payload|invalid config(?:uration)?)\b/i,
+	/\b(?:permission denied|access denied)\b/i,
+];
+const RECOVERABLE_PROBE_REASON_PATTERNS = [
+	/fetch failed/i, /\b(?:connection|network|socket)\b.*\b(?:error|reset|closed|refused|abort(?:ed)?)\b/i, /socket hang up/i,
+	/stream.*(?:abort|ended|closed|reset)/i, /\b(?:timed?\s*out|timeout)\b/i,
+	/overload(?:ed)?/i, /service\s+(?:temporarily\s+)?unavailable/i, /temporar(?:ily)? unavailable/i,
+	/provider\s+(?:temporarily\s+)?unavailable/i, /\bupstream\s+(?:error|timeout|unavailable|overload(?:ed)?|5\d\d)\b/i,
+	/\b(?:500|502|503|504|5xx)\b/i, /internal server error/i, /cold.?start/i,
+	/empty response/i, /produced no output/i,
+];
+
+/** True only for transport/provider-availability exclusions safe to re-probe. */
+export function isReprobeEligibleTransientReason(reason: string | undefined): boolean {
+	if (!reason) return false;
+	return !NON_RECOVERABLE_PROBE_REASON_PATTERNS.some((pattern) => pattern.test(reason))
+		&& RECOVERABLE_PROBE_REASON_PATTERNS.some((pattern) => pattern.test(reason));
+}
+
+/**
+ * Return one probe only when every supplied candidate is cache-excluded solely
+ * for a narrowly re-probe-eligible transient reason. This plans only; it never
+ * acquires ownership or sends a request, so preflight remains side-effect free.
+ */
+export function planTransientModelRecoveryProbe(candidates: readonly string[]): ModelRecoveryProbe | undefined {
+	if (candidates.length === 0) return undefined;
+	const matches = candidates.map((candidate) => ({ candidate, exclusion: findModelExclusion(candidate) }));
+	if (!matches.every((match) => match.exclusion && isReprobeEligibleTransientReason(match.exclusion.reason))) return undefined;
+	const first = matches[0]!;
+	return { candidate: first.candidate, exclusion: first.exclusion! };
+}
+
+const PROBE_LOCK_TTL_MS = 30 * 60_000;
+
+type StoredClaim = { owner: string; pid: number; expiresAt: number; processStart?: string };
+
+function probeClaimsDirectory(candidate: string): string {
+	return path.join(`${getExclusionsFilePath()}.recovery-probes`, Buffer.from(candidate).toString("base64url"));
+}
+
+function isLiveProcess(pid: unknown): boolean {
+	if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means the process exists but is not signalable by this user. Treat it
+		// as live: an unnecessary wait is safe; a duplicate provider request is not.
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function readClaim(claimPath: string): StoredClaim | undefined {
+	const node = readClaimNode(claimPath);
+	return node.status === "present" ? node.claim : undefined;
+}
+
+function writeImmutableClaim(claimDir: string, owner: string, filename: string): string | undefined {
+	const claimPath = path.join(claimDir, filename);
+	const temporaryPath = `${claimPath}.${process.pid}.${randomUUID()}.tmp`;
+	try {
+		fs.writeFileSync(temporaryPath, JSON.stringify({
+			version: 2, owner, pid: process.pid, processStart: processStartIdentity(process.pid), expiresAt: Date.now() + PROBE_LOCK_TTL_MS,
+		}), { encoding: "utf-8", mode: 0o600 });
+		const fd = fs.openSync(temporaryPath, "r");
+		try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+		// link is create-only: the canonical path is complete or absent.
+		fs.linkSync(temporaryPath, claimPath);
+		return claimPath;
+	} catch {
+		return undefined;
+	} finally {
+		try { fs.rmSync(temporaryPath, { force: true }); } catch { /* best effort */ }
+	}
+}
+
+/** Atomically own a planned probe across foreground and detached processes. */
+export function claimTransientModelRecoveryProbe(candidate: string): ModelRecoveryProbeClaim {
+	const planned = planTransientModelRecoveryProbe([candidate]);
+	if (!planned) return { status: "not-eligible" };
+	const claimDir = probeClaimsDirectory(candidate);
+	const owner = `${process.pid}-${randomUUID()}`;
+	try {
+		fs.mkdirSync(claimDir, { recursive: true, mode: 0o700 });
+	} catch {
+		return { status: "in-flight" };
+	}
+	// A previous-version single-file claim remains compatible. A verified-live
+	// legacy PID wins even after expiry; an expired dead claim no longer blocks.
+	const legacy = readClaim(`${claimDir}.json`);
+	if (legacy && claimIsLive(legacy)) return { status: "in-flight" };
+	// The fixed canonical generation is an O_EXCL election: exactly one link can
+	// succeed. A contender that arrives before the winner publishes loses on
+	// EEXIST; a contender arriving after observes the same live generation. Thus
+	// there is no publish-then-scan interleaving that can elect zero owners.
+	const claim = acquireCanonicalClaim(path.join(claimDir, "canonical.json"), owner, 0);
+	if (!claim) return { status: "in-flight" };
+	return { status: "claimed", probe: { ...planned, owner } };
+}
+
+/** Release ownership and, after a successful real child attempt, clear only its recorded transient exclusion. */
+export function releaseTransientModelRecoveryProbe(probe: ClaimedModelRecoveryProbe, succeeded: boolean): void {
+	try {
+		if (succeeded) clearRecoveredTransientExclusion(probe);
+	} finally {
+		const claimDir = probeClaimsDirectory(probe.candidate);
+		const claimPath = findClaimPathForOwner(path.join(claimDir, "canonical.json"), probe.owner);
+		if (claimPath) releaseCanonicalClaim(claimPath, probe.owner);
+	}
+}
+
+function clearRecoveredTransientExclusion(probe: ClaimedModelRecoveryProbe): void {
+	// Reload under the store mutation lease so a successful clear removes exactly
+	// its recorded entry while retaining failures written by other processes.
+	withExclusionStoreMutation((current) => {
+		const { provider, modelId } = parseModelKey(probe.candidate);
+		return current.filter((entry) => !(entry.provider === probe.exclusion.provider
+			&& entry.modelId === probe.exclusion.modelId
+			&& entry.recordedAt === probe.exclusion.recordedAt
+			&& entry.expiresAt === probe.exclusion.expiresAt
+			&& entry.reason === probe.exclusion.reason
+			&& entryMatches(entry, modelId, provider, Date.now())
+			&& isReprobeEligibleTransientReason(entry.reason)));
+	});
 }
 
 /**

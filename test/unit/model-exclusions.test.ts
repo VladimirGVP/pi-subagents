@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -13,6 +14,10 @@ import {
 	getExclusionsFilePath,
 	isExcluded,
 	parseModelKey,
+	planTransientModelRecoveryProbe,
+	claimTransientModelRecoveryProbe,
+	releaseTransientModelRecoveryProbe,
+	isReprobeEligibleTransientReason,
 	recordModelFailure,
 	reloadFromDisk,
 	MAX_MODEL_EXCLUSION_TTL_MS,
@@ -36,6 +41,29 @@ function captureConsole(method: "error" | "warn", run: () => void): unknown[][] 
 }
 process.env.PI_CODING_AGENT_DIR = testAgentDir;
 const authPath = path.join(testAgentDir, "auth.json");
+
+function runIsolatedModule(script: string, environment: NodeJS.ProcessEnv): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "--eval", script], {
+			cwd: process.cwd(), env: environment, stdio: ["ignore", "pipe", "pipe"],
+		});
+		let output = "";
+		let error = "";
+		child.stdout.on("data", (chunk) => { output += chunk; });
+		child.stderr.on("data", (chunk) => { error += chunk; });
+		child.on("error", reject);
+		child.on("close", (code) => code === 0 ? resolve(output.trim()) : reject(new Error(error || `child exited ${code}`)));
+	});
+}
+
+async function waitForFiles(directory: string, count: number): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (fs.readdirSync(directory).length >= count) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	throw new Error(`Timed out waiting for ${count} claim readers.`);
+}
 
 // The exclusion store is a process-wide singleton persisted under TEMP_ROOT_DIR
 // (isolated per test run by test/support/isolated-temp-root.mjs). Clear it
@@ -90,6 +118,157 @@ describe("model exclusions — record & query", () => {
 		recordModelFailure({ modelId: "gpt-4", provider: "openai" });
 		recordModelFailure({ modelId: "claude", provider: "anthropic" });
 		assert.equal(getExcludedCount(), 2);
+	});
+});
+
+describe("model exclusions — transient recovery probes", () => {
+	it("classifies only narrow transient transport/provider reasons", () => {
+		for (const reason of ["fetch failed", "socket hang up", "request timed out", "503 service unavailable", "upstream 502", "cold-start empty response"]) {
+			assert.equal(isReprobeEligibleTransientReason(reason), true, reason);
+		}
+		for (const reason of ["upstream", "invalid api key", "429 rate limit", "quota exceeded", "model not found", "model disabled", "invalid_request_error", "invalid request: upstream 503", "permission denied: 503", "access denied: upstream 5xx"]) {
+			assert.equal(isReprobeEligibleTransientReason(reason), false, reason);
+		}
+	});
+
+	it("plans and atomically owns one probe only when every candidate is transiently excluded", () => {
+		recordModelFailure({ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable" });
+		recordModelFailure({ modelId: "claude", provider: "anthropic", reason: "fetch failed" });
+		assert.equal(planTransientModelRecoveryProbe(["openai/gpt-4", "anthropic/claude"])?.candidate, "openai/gpt-4");
+		const first = claimTransientModelRecoveryProbe("openai/gpt-4");
+		assert.equal(first.status, "claimed");
+		assert.equal(claimTransientModelRecoveryProbe("openai/gpt-4").status, "in-flight");
+		if (first.status === "claimed") releaseTransientModelRecoveryProbe(first.probe, true);
+		assert.equal(findModelExclusion("openai/gpt-4"), undefined);
+		assert.equal(findModelExclusion("anthropic/claude")?.reason, "fetch failed");
+	});
+
+	it("does not plan a probe for mixed or permanent exclusions and preserves failed probes", () => {
+		recordModelFailure({ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable" });
+		recordModelFailure({ modelId: "claude", provider: "anthropic", reason: "quota exceeded" });
+		assert.equal(planTransientModelRecoveryProbe(["openai/gpt-4", "anthropic/claude"]), undefined);
+		assert.equal(planTransientModelRecoveryProbe(["openai/gpt-4"])?.candidate, "openai/gpt-4");
+		const claim = claimTransientModelRecoveryProbe("openai/gpt-4");
+		if (claim.status === "claimed") releaseTransientModelRecoveryProbe(claim.probe, false);
+		assert.equal(findModelExclusion("openai/gpt-4")?.reason, "503 service unavailable");
+	});
+
+	it("clears only the exact provider/model target when immutable metadata collides", () => {
+		const now = Date.now();
+		fs.writeFileSync(getExclusionsFilePath(), JSON.stringify({ version: 1, exclusions: [
+			{ provider: "openai", reason: "503", recordedAt: now, expiresAt: now + 60_000 },
+			{ provider: "openai", modelId: "gpt-4", reason: "503", recordedAt: now, expiresAt: now + 60_000 },
+		] }), "utf-8");
+		reloadFromDisk();
+		const claim = claimTransientModelRecoveryProbe("openai/gpt-4");
+		assert.equal(claim.status, "claimed");
+		if (claim.status === "claimed") releaseTransientModelRecoveryProbe(claim.probe, true);
+		reloadFromDisk();
+		assert.equal(findModelExclusion("openai/gpt-4")?.modelId, "gpt-4");
+	});
+
+	it("recovers from a malformed canonical node without changing that predecessor", () => {
+		recordModelFailure({ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable" });
+		const claimDir = path.join(`${getExclusionsFilePath()}.recovery-probes`, Buffer.from("openai/gpt-4").toString("base64url"));
+		fs.mkdirSync(claimDir, { recursive: true });
+		const canonical = path.join(claimDir, "canonical.json");
+		fs.writeFileSync(canonical, "{", "utf-8");
+		const first = claimTransientModelRecoveryProbe("openai/gpt-4");
+		assert.equal(first.status, "claimed");
+		const firstSuccessors = fs.readdirSync(claimDir).filter((file) => file.includes(".successor-"));
+		assert.equal(firstSuccessors.length, 1);
+		if (first.status === "claimed") releaseTransientModelRecoveryProbe(first.probe, false);
+		assert.equal(fs.readdirSync(claimDir).filter((file) => file.includes(".successor-")).length, 0);
+		const second = claimTransientModelRecoveryProbe("openai/gpt-4");
+		assert.equal(second.status, "claimed");
+		assert.deepEqual(fs.readdirSync(claimDir).filter((file) => file.includes(".successor-")), firstSuccessors);
+		if (second.status === "claimed") releaseTransientModelRecoveryProbe(second.probe, false);
+		assert.equal(fs.readFileSync(canonical, "utf-8"), "{");
+	});
+
+	it("reclaims a reused PID generation but never steals an expired verified-live generation", () => {
+		recordModelFailure({ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable" });
+		const candidate = "openai/gpt-4";
+		const claimDir = path.join(`${getExclusionsFilePath()}.recovery-probes`, Buffer.from(candidate).toString("base64url"));
+		fs.mkdirSync(claimDir, { recursive: true });
+		const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf-8");
+		const processStart = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/)[19]!;
+		const canonical = path.join(claimDir, "canonical.json");
+		fs.writeFileSync(canonical, JSON.stringify({ owner: "old", pid: process.pid, processStart: "different-generation", expiresAt: Date.now() + 60_000 }), "utf-8");
+		const reclaimed = claimTransientModelRecoveryProbe(candidate);
+		assert.equal(reclaimed.status, "claimed");
+		if (reclaimed.status === "claimed") releaseTransientModelRecoveryProbe(reclaimed.probe, false);
+		fs.writeFileSync(canonical, JSON.stringify({ owner: "live", pid: process.pid, processStart, expiresAt: Date.now() - 1 }), "utf-8");
+		assert.equal(claimTransientModelRecoveryProbe(candidate).status, "in-flight");
+		fs.rmSync(claimDir, { recursive: true, force: true });
+	});
+
+	it("elects one successor after both OS-process contenders read the same stale genesis", async () => {
+		const store = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-probe-contention-")), "exclusions.json");
+		const candidate = "openai/gpt-4";
+		const claimDir = path.join(`${store}.recovery-probes`, Buffer.from(candidate).toString("base64url"));
+		const canonical = path.join(claimDir, "canonical.json");
+		const stale = JSON.stringify({ owner: "dead", pid: 999_999_999, expiresAt: Date.now() - 1 });
+		const barrier = path.join(path.dirname(store), "barrier");
+		const ready = path.join(barrier, "ready");
+		const go = path.join(barrier, "go");
+		const published = path.join(barrier, "published");
+		fs.mkdirSync(ready, { recursive: true });
+		fs.mkdirSync(claimDir, { recursive: true });
+		fs.writeFileSync(canonical, stale, "utf-8");
+		fs.writeFileSync(store, JSON.stringify({ version: 1, exclusions: [{ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable", recordedAt: Date.now(), expiresAt: Date.now() + 60_000 }] }), "utf-8");
+		const modulePath = path.resolve("src/runs/shared/model-exclusions.ts");
+		const makeScript = (role: "a" | "b") => `
+			import { createRequire } from "node:module";
+			import { syncBuiltinESMExports } from "node:module";
+			const require = createRequire(import.meta.url); const fs = require("node:fs");
+			const canonical = ${JSON.stringify(canonical)}, ready = ${JSON.stringify(ready)}, go = ${JSON.stringify(go)}, published = ${JSON.stringify(published)};
+			const sleep = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+			const read = fs.readFileSync; let paused = false;
+			fs.readFileSync = (...args) => { const value = read(...args); if (!paused && args[0] === canonical) { paused = true; fs.writeFileSync(ready + "/${role}", ""); while (!fs.existsSync(go)) sleep(); } return value; };
+			${role === "a" ? "const link = fs.linkSync; fs.linkSync = (...args) => { const value = link(...args); fs.writeFileSync(published, \"\"); return value; };" : "const exists = fs.existsSync; fs.existsSync = (file) => { if (file === canonical) while (!exists(published)) sleep(); return exists(file); };"}
+			syncBuiltinESMExports();
+			const { claimTransientModelRecoveryProbe } = await import(${JSON.stringify(modulePath)});
+			console.log(claimTransientModelRecoveryProbe(${JSON.stringify(candidate)}).status);
+			setTimeout(() => {}, 100);
+		`;
+		const environment = { ...process.env, ["PI_MODEL_EXCLUSIONS_PATH"]: store };
+		try {
+			const contenders = [runIsolatedModule(makeScript("a"), environment), runIsolatedModule(makeScript("b"), environment)];
+			await waitForFiles(ready, 2);
+			fs.writeFileSync(go, "");
+			const results = await Promise.all(contenders);
+			assert.equal(results.filter((result) => result === "claimed").length, 1);
+			assert.equal(fs.readFileSync(canonical, "utf-8"), stale);
+			assert.equal(fs.readdirSync(claimDir).filter((file) => file.includes(".successor-")).length, 1);
+		} finally {
+			fs.rmSync(path.dirname(store), { recursive: true, force: true });
+		}
+	});
+
+	it("merges a concurrent auth write when a successful probe clears its transient exclusion", async () => {
+		const store = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pi-probe-merge-")), "exclusions.json");
+		const previousStore = process.env.PI_MODEL_EXCLUSIONS_PATH;
+		process.env.PI_MODEL_EXCLUSIONS_PATH = store;
+		try {
+			reloadFromDisk();
+			recordModelFailure({ modelId: "gpt-4", provider: "openai", reason: "503 service unavailable" });
+			const claim = claimTransientModelRecoveryProbe("openai/gpt-4");
+			assert.equal(claim.status, "claimed");
+			const modulePath = path.resolve("src/runs/shared/model-exclusions.ts");
+			const script = `import { recordModelFailure } from ${JSON.stringify(modulePath)}; recordModelFailure({ modelId: "claude", provider: "anthropic", reason: "invalid api key" });`;
+			const writer = runIsolatedModule(script, { ...process.env, ["PI_MODEL_EXCLUSIONS_PATH"]: store });
+			if (claim.status === "claimed") releaseTransientModelRecoveryProbe(claim.probe, true);
+			await writer;
+			reloadFromDisk();
+			assert.equal(findModelExclusion("openai/gpt-4"), undefined);
+			assert.equal(findModelExclusion("anthropic/claude")?.reason, "invalid api key");
+		} finally {
+			if (previousStore === undefined) delete process.env.PI_MODEL_EXCLUSIONS_PATH;
+			else process.env.PI_MODEL_EXCLUSIONS_PATH = previousStore;
+			reloadFromDisk();
+			fs.rmSync(path.dirname(store), { recursive: true, force: true });
+		}
 	});
 });
 
@@ -217,6 +396,8 @@ describe("model exclusions — persistence", () => {
 		reloadFromDisk();
 		assert.equal(findModelExclusion("openai/gpt-4"), undefined);
 		assert.equal(isExcluded("gpt-4", "openai"), false);
+		reloadFromDisk();
+		assert.equal(findModelExclusion("openai/gpt-4"), undefined);
 	});
 
 	it("keeps a non-auth exclusion after auth.json is modified", () => {

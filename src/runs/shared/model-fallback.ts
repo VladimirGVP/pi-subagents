@@ -1,6 +1,6 @@
 import { splitKnownThinkingSuffix as splitThinkingSuffix, type ModelInfo as AvailableModelInfo } from "../../shared/model-info.ts";
 import type { Usage } from "../../shared/types.ts";
-import { filterFallbackCandidates, findModelExclusion, parseModelKey, recordModelFailure } from "./model-exclusions.ts";
+import { filterFallbackCandidates, findModelExclusion, parseModelKey, planTransientModelRecoveryProbe, recordModelFailure } from "./model-exclusions.ts";
 import { checkModelScope, type ModelScopeCheckRule, type ModelScopeViolation, type ModelSource } from "./model-scope.ts";
 import { redactSecretValues } from "./permissions.ts";
 
@@ -315,24 +315,6 @@ function formatExcludedCandidateEvidence(candidate: string, exclusion: NonNullab
 	return `${displayCandidate} — model: ${displayModel}; provider: ${displayProvider}; reason: ${reason}; expires: ${formatModelExclusionExpiry(exclusion.expiresAt)}`;
 }
 
-const MODEL_UNAVAILABLE_EXCLUSION_PATTERNS = [
-	/model.*not found/i,
-	/unknown model/i,
-	/model.*unavailable/i,
-	/model.*disabled/i,
-];
-
-function isCurrentRegistryModel(candidate: string, availableModels: AvailableModelInfo[] | undefined): boolean {
-	if (!availableModels || availableModels.length === 0) return false;
-	const { baseModel } = splitThinkingSuffix(candidate);
-	return availableModels.some((entry) => entry.fullId === baseModel);
-}
-
-function ignoreStaleModelUnavailableExclusion(candidate: string, exclusion: NonNullable<ReturnType<typeof findModelExclusion>>, availableModels: AvailableModelInfo[] | undefined): boolean {
-	const reason = exclusion.reason ?? "";
-	return MODEL_UNAVAILABLE_EXCLUSION_PATTERNS.some((pattern) => pattern.test(reason)) && isCurrentRegistryModel(candidate, availableModels);
-}
-
 function throwForExplicitModelExclusion(model: string): void {
 	const exclusion = findModelExclusion(model);
 	if (!exclusion) return;
@@ -432,7 +414,7 @@ export interface BuildModelCandidatesOptions {
 }
 
 const ZERO_USABLE_MODEL_CANDIDATES_ERROR =
-	"No usable subagent models remain after registry, scope, and cached-exclusion filtering.";
+	"No usable subagent models remain after registry, scope, and cached-exclusion filtering (cache-blocked/unprobed).";
 
 export function resolveModelOrigin(input: {
 	explicitModel?: string | boolean;
@@ -511,11 +493,19 @@ export function buildModelCandidates(
 		seen.add(normalized);
 		candidates.push(normalized);
 	}
-	const resolved = filterFallbackCandidates(candidates, {
-		onExcluded: warnCachedExclusion,
-		ignoreExclusion: (candidate, exclusion) => ignoreStaleModelUnavailableExclusion(candidate, exclusion, availableModels),
-	});
+	const resolved = filterFallbackCandidates(candidates, { onExcluded: warnCachedExclusion });
 	if (resolved.length === 0) {
+		// Deliberately plan rather than claim here: this same helper is used by
+		// preflight, which must describe a viable runtime probe without consuming it.
+		const recoveryProbe = origin === "explicit" ? undefined : planTransientModelRecoveryProbe(candidates);
+		if (recoveryProbe) {
+			// A probe can refresh only a fully resolved configuration. Otherwise an
+			// excluded live candidate could mask a configured typo.
+			if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
+			if (skippedFallback) resolveRequiredSubagentModelCandidate(skippedFallback, availableModels, preferredProvider);
+			console.warn(`[pi-subagents] Cached exclusions leave no ordinary candidate; planning one transient recovery probe for '${sanitizeModelExclusionDiagnostic(recoveryProbe.candidate, "unknown")}'.`);
+			return [recoveryProbe.candidate];
+		}
 		if (skippedPrimary) resolveRequiredSubagentModelCandidate(skippedPrimary, availableModels, preferredProvider);
 		if (candidates.length === 0 && skippedFallback) resolveRequiredSubagentModelCandidate(skippedFallback, availableModels, preferredProvider);
 		if (candidates.length > 0) {
@@ -654,3 +644,11 @@ export function formatModelAttemptNote(attempt: ModelAttemptSummary, nextModel?:
 		? `[fallback] ${attempt.model} failed: ${failure}. Retrying with ${nextModel}.`
 		: `[fallback] ${attempt.model} failed: ${failure}.`;
 }
+
+/** Sanitized terminal diagnostics for the one real request allowed to refresh a transient exclusion. */
+export function formatTransientRecoveryProbeFailure(error: string | undefined): string {
+	return `Transient recovery probe failed; provider remains live-unavailable: ${sanitizeModelExclusionDiagnostic(error, "runtime-failure")}.`;
+}
+
+export const TRANSIENT_RECOVERY_PROBE_IN_FLIGHT =
+	"Transient recovery probe already in flight; provider remains cache-blocked/unprobed.";

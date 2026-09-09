@@ -80,10 +80,13 @@ import {
 	buildModelCandidates,
 	formatSubagentModelVerificationError,
 	formatModelAttemptNote,
+	formatTransientRecoveryProbeFailure,
 	isContextOverflow,
 	isRetryableModelFailureAttempt,
 	recordRetryableModelFailure,
+	TRANSIENT_RECOVERY_PROBE_IN_FLIGHT,
 } from "../shared/model-fallback.ts";
+import { claimTransientModelRecoveryProbe, releaseTransientModelRecoveryProbe } from "../shared/model-exclusions.ts";
 import {
 	createMutatingFailureState,
 	didMutatingToolFail,
@@ -1934,7 +1937,20 @@ async function runSyncCompletionInner(
 			const verifyModel = Boolean(candidate) && !(options.modelOverrideFromParent && modelIndex === 0);
 			const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
 			if (recoveryState === "readonly-continuation") attemptOptions.deadlineAt = continuationDeadline;
-			const result = await runSingleAttempt(runtimeCwd, agent, attemptTask, candidate, attemptOptions, {
+			// Acquire only after all loop/preflight state is ready and immediately before
+			// the child session is constructed. A thrown setup path below releases it.
+			const probeClaim = modelsToTry.length === 1 && candidate ? claimTransientModelRecoveryProbe(candidate) : undefined;
+			if (probeClaim?.status === "in-flight") {
+				lastResult = withRunContext({
+					index: options.index ?? 0, agent: agent.name, task, exitCode: 1, messages: [], usage: emptyUsage(),
+					error: TRANSIENT_RECOVERY_PROBE_IN_FLIGHT, model: candidate,
+				}, options.context);
+				attemptNotes.push(`[fallback] ${TRANSIENT_RECOVERY_PROBE_IN_FLIGHT}`);
+				break modelAttemptsLoop;
+			}
+			let result: SingleResult;
+			try {
+				result = await runSingleAttempt(runtimeCwd, agent, attemptTask, candidate, attemptOptions, {
 				sessionEnabled,
 				systemPrompt,
 				acceptancePrompt,
@@ -1955,7 +1971,11 @@ async function runSyncCompletionInner(
 				readonlyExpected,
 				readonlyModel,
 				readonlyHandoffAllowed: readonlyExpected ? readonlyHandoffAllowed : undefined,
-			});
+				});
+			} catch (error) {
+				if (probeClaim?.status === "claimed") releaseTransientModelRecoveryProbe(probeClaim.probe, false);
+				throw error;
+			}
 			lastResult = result;
 			if (!recoveringAbort) {
 				if (result.model) attemptedModels.push(result.model);
@@ -1965,6 +1985,7 @@ async function runSyncCompletionInner(
 			totalToolCount += result.progressSummary?.toolCount ?? 0;
 			totalDurationMs += result.progressSummary?.durationMs ?? 0;
 			const attemptSucceeded = result.exitCode === 0 && !result.error;
+			if (probeClaim?.status === "claimed" && attemptSucceeded) releaseTransientModelRecoveryProbe(probeClaim.probe, true);
 			const attempt: ModelAttempt = {
 				model: result.model ?? candidate ?? agent.model ?? "default",
 				success: attemptSucceeded,
@@ -1973,6 +1994,16 @@ async function runSyncCompletionInner(
 				usage: { ...result.usage },
 			};
 			modelAttempts.push(attempt);
+			if (probeClaim?.status === "claimed" && !attemptSucceeded) {
+				if (isRetryableModelFailureAttempt({ error: result.error, messages: result.messages, toolCount: result.progressSummary?.toolCount })) {
+					recordRetryableModelFailure(result.model ?? candidate, result.error);
+				}
+				releaseTransientModelRecoveryProbe(probeClaim.probe, false);
+				result.error = formatTransientRecoveryProbeFailure(result.error);
+				attempt.error = result.error;
+				attemptNotes.push(`[fallback] ${result.error}`);
+				break modelAttemptsLoop;
+			}
 			// A consumed retained continuation is terminal even on a startup error or abort.
 			if (recoveryState === "readonly-continuation") break modelAttemptsLoop;
 			const source = settledReadonlySource.get(result);
@@ -2036,8 +2067,7 @@ async function runSyncCompletionInner(
 					nextAttemptTask = abortRecovery.prompt;
 					attemptNotes.push("[abort-recovery] provider/transport abort after useful progress; resuming the retained child session once.");
 					continue;
-				}
-				if (abortRecovery.diagnostic) {
+				} else if (abortRecovery.diagnostic) {
 					result.error = result.error ? `${result.error}\n${abortRecovery.diagnostic}` : abortRecovery.diagnostic;
 					attempt.error = result.error;
 					break modelAttemptsLoop;
