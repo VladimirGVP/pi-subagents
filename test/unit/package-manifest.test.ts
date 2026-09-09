@@ -116,6 +116,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.deepEqual(packageJson.exports, {
 		".": "./index.ts",
 		"./agents": "./src/api/agents.ts",
+		"./resource-inspection": "./src/api/resource-inspection.ts",
 		"./background-work": "./src/api/background-work.ts",
 		"./external-job-provider": "./src/api/external-job-provider.ts",
 		"./external-runs": "./src/api/external-runs.ts",
@@ -129,6 +130,36 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./shared-types": "./src/api/shared-types.ts",
 		"./project-panes": "./src/api/project-panes.ts",
 	});
+	assert.deepEqual(packageJson.bin, {
+		"pi-subagents": "install.mjs",
+		"pi-subagents-inspect-resources": "resource-inspector.mjs",
+	});
+	const lock = JSON.parse(
+		fs.readFileSync(path.join(projectRoot, "package-lock.json"), "utf-8"),
+	);
+	assert.deepEqual(lock.packages[""].bin, packageJson.bin);
+	assert.ok(fs.existsSync(path.join(projectRoot, "resource-inspector.mjs")));
+	const inspection = await import("pi-subagents/resource-inspection");
+	assert.deepEqual(Object.keys(inspection).sort(), [
+		"ResourceInspectionError",
+		"inspectResources",
+		"parseResourceInspectionArgs",
+	]);
+	assert.deepEqual(
+		inspection.parseResourceInspectionArgs([
+			"--cwd",
+			"/project",
+			"--agent-dir",
+			"/config",
+			"--project-trust",
+			"trusted",
+		]),
+		{
+			cwd: "/project",
+			agentDir: "/config",
+			projectTrust: "trusted",
+		},
+	);
 	const agents = await import("pi-subagents/agents");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_EVENT, "pi-subagents:runtime-agent-register:v1");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_VERSION, 1);

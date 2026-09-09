@@ -11,6 +11,7 @@
     "./external-job-provider": "./src/api/external-job-provider.ts",
     "./external-runs": "./src/api/external-runs.ts",
     "./agents": "./src/api/agents.ts",
+    "./resource-inspection": "./src/api/resource-inspection.ts",
     "./delegation": "./src/api/delegation.ts",
     "./capability-ceiling": "./src/api/capability-ceiling.ts",
     "./workflow-resources": "./src/api/workflow-resources.ts",
@@ -39,7 +40,8 @@
     "cli"
   ],
   "bin": {
-    "pi-subagents": "install.mjs"
+    "pi-subagents": "install.mjs",
+    "pi-subagents-inspect-resources": "resource-inspector.mjs"
   },
   "files": [
     "index.ts",

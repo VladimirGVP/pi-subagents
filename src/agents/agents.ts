@@ -1366,7 +1366,7 @@ function applyBuiltinOverride(
 		...meta,
 		base: agent.override?.base ?? cloneOverrideBase(agent),
 		fields: [...new Set([...(agent.override?.fields ?? []), ...Object.keys(override)])].sort(),
-		fieldScopes: Object.fromEntries(Object.entries({ ...(agent.override?.fieldScopes ?? {}) }).map(([field, scopes]) => [field, [...scopes]])),
+		fieldScopes: Object.fromEntries(Object.entries({ ...agent.override?.fieldScopes }).map(([field, scopes]) => [field, [...scopes]])),
 	};
 	for (const field of Object.keys(override)) {
 		const scopes = overrideInfo.fieldScopes![field] ?? [];
@@ -2335,9 +2335,18 @@ export interface AgentDiscoveryAllResult {
  * disabled and shadowed definitions are needed for diagnostics and runtime
  * collision checks even when they are not launchable.
  */
+export interface AgentDiscoveryCandidate {
+	name: string;
+	source: AgentSource;
+	filePath: string;
+	discoveryPriority?: number;
+}
+
 export interface AgentDiscoverySnapshot {
 	effective: AgentDiscoveryResult;
 	all: AgentDiscoveryAllResult;
+	/** Opt-in metadata from loaded definitions, before same-source name deduplication. */
+	candidates?: AgentDiscoveryCandidate[];
 }
 
 interface LoadedAgentDirectory {
@@ -2732,11 +2741,24 @@ export function discoverAgentSnapshot(
 	cwd: string,
 	scope: AgentScope,
 	preferredModelProvider?: string,
-	options: { includeChains?: boolean } = {},
+	options: { includeChains?: boolean; includeCandidateMetadata?: boolean } = {},
 ): AgentDiscoverySnapshot {
 	const includeChains = options.includeChains !== false;
 	const sources = getAgentDiscoverySources(cwd, preferredModelProvider, includeChains);
-	return { effective: buildEffectiveDiscovery(sources, scope), all: buildAllDiscovery(sources, includeChains, scope) };
+	const snapshot: AgentDiscoverySnapshot = { effective: buildEffectiveDiscovery(sources, scope), all: buildAllDiscovery(sources, includeChains, scope) };
+	if (options.includeCandidateMetadata) {
+		snapshot.candidates = [
+			...sources.builtinLoaded.agents,
+			...sources.packageLoaded.flatMap((directory) => directory.loaded.agents),
+			...sources.userLoaded.flatMap((directory) => directory.loaded.agents),
+			...sources.projectLoaded.flatMap((directory) => directory.loaded.agents),
+		].map(({ name, source, filePath, discoveryPriority }) => {
+			const candidate: AgentDiscoveryCandidate = { name, source, filePath };
+			if (discoveryPriority !== undefined) candidate.discoveryPriority = discoveryPriority;
+			return candidate;
+		});
+	}
+	return snapshot;
 }
 
 function discoverAgentsUncached(cwd: string, scope: AgentScope, preferredModelProvider?: string): AgentDiscoveryResult {
